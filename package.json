@@ -1,0 +1,25 @@
+{
+  "name": "pdp-pull-loadtool",
+  "version": "0.1.0",
+  "description": "Load tool for Curio PDPv0 pull flow (POST /pdp/piece/pull) — exercises PR #1245 refactor: backpressure, multi-URL, stale expiry, soak.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "loader": "tsx src/index.ts loader",
+    "source": "tsx src/index.ts source"
+  },
+  "dependencies": {
+    "@filoz/synapse-core": "^0.5.2",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "multiformats": "^13.3.1",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}
