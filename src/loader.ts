@@ -18,7 +18,6 @@ import { calibration, mainnet, type Chain as FocChain } from '@filoz/synapse-cor
 import { parse as parsePieceCid } from '@filoz/synapse-core/piece'
 import { signCreateDataSetAndAddPieces } from '@filoz/synapse-core/typed-data'
 import { randU256 } from '@filoz/synapse-core/utils'
-import { getPdpDataSets } from '@filoz/synapse-core/warm-storage'
 import { getPDPProvider, getPDPProviders } from '@filoz/synapse-core/sp-registry'
 import type { DerivedPiece } from './piece.js'
 
@@ -117,32 +116,23 @@ export class PullLoader {
       }
     }
 
-    // Step 2: existing dataset for this signer.
-    // Use getPdpDataSets so we get `live` — getClientDataSets returns rows that
-    // are still indexed even after DataSetPaymentAlreadyTerminated (selector
-    // 0x211a40c0), and picking such a row makes eth_call validation revert.
+    // Step 2: dataset selection.
+    // Pull requests never create a dataset on-chain (handler does eth_call
+    // only — see pdp/handlers_pull.go), so the cheapest, most reliable thing
+    // is to always send dataSetId=0 and let Curio simulate createDataSet.
+    //
+    // Picking an existing dataset only saves work IF its payment row hasn't
+    // been terminated on FWSS. `live` from PDPVerifier reports deletion
+    // status, not payment status — an FWSS-terminated dataset still shows
+    // live=true here, and signing addPieces against it makes eth_call revert
+    // with DataSetPaymentAlreadyTerminated(0x211a40c0).
+    //
+    // Explicit DATA_SET_ID in .env is still honored — caller takes
+    // responsibility for it being usable.
     if (this.cfg.dataSetId === 0n) {
-      try {
-        const sets = await getPdpDataSets(this.publicClient as any, { address: this.account.address })
-        const live = sets.filter((s) => s.live && s.dataSetId > 0n)
-        const dead = sets.length - live.length
-        if (live.length > 0) {
-          const pick = (this.cfg.providerId != null
-            ? live.find((s) => s.providerId === this.cfg.providerId)
-            : undefined) ?? live[0]
-          this.cfg.dataSetId = pick.dataSetId
-          if (!this.cfg.payee) this.cfg.payee = pick.payee
-          console.log(`[discover] dataSetId=${pick.dataSetId} (live; ${dead} terminated rows ignored; payee=${pick.payee} providerId=${pick.providerId})`)
-        } else if (dead > 0) {
-          console.log(`[discover] no live dataset (found ${dead} terminated) — pull will go through the create-new eth_call path; no on-chain dataset is actually created`)
-        } else {
-          console.log(`[discover] no existing dataset for ${this.account.address} — pull will go through the create-new eth_call path`)
-        }
-      } catch (e) {
-        console.warn(`[discover] getPdpDataSets failed: ${(e as Error).message}`)
-      }
+      console.log(`[discover] dataSetId=0 — pull will take the create-new eth_call path (no on-chain dataset is actually created)`)
     } else {
-      console.log(`[discover] dataSetId=${this.cfg.dataSetId} (from config)`)
+      console.log(`[discover] dataSetId=${this.cfg.dataSetId} (from config — caller takes responsibility for it being usable)`)
     }
 
     // Step 3: still no curioUrl? Can't proceed.
