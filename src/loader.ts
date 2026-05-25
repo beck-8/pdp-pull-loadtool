@@ -16,7 +16,7 @@ import { createPublicClient, createWalletClient, http, type Address, type Hex, t
 import { privateKeyToAccount } from 'viem/accounts'
 import { calibration, mainnet, type Chain as FocChain } from '@filoz/synapse-core/chains'
 import { parse as parsePieceCid } from '@filoz/synapse-core/piece'
-import { signAddPieces, signCreateDataSetAndAddPieces } from '@filoz/synapse-core/typed-data'
+import { signCreateDataSetAndAddPieces } from '@filoz/synapse-core/typed-data'
 import { randU256 } from '@filoz/synapse-core/utils'
 import { getClientDataSets } from '@filoz/synapse-core/warm-storage'
 import { getPDPProvider, getPDPProviders } from '@filoz/synapse-core/sp-registry'
@@ -195,24 +195,25 @@ export class PullLoader {
   }
 
   /**
-   * Sign extraData appropriate for the (dataSetId, pieces) tuple. Each call
-   * uses a fresh client-dataset-id nonce so two submissions hash to different
-   * idempotency keys (otherwise the second one returns the first one's status).
+   * Sign extraData for the pull endpoint. Always uses the combined format
+   * `(createPayload, addPayload)`. Curio's handler unconditionally calls
+   * FWSSPayerFromExtraData which parses combined to extract the payer for
+   * per-client backpressure — sending just an addPayload (signAddPieces) makes
+   * the abi decode fail with "offset … would go over slice boundary".
+   * See pdp/indexing.go:103 (decodeFWSSCreatePayload) and
+   * pdp/handlers_pull_test.go:102 (makeTestExtraData reference fixture).
+   *
+   * Each call uses a fresh clientDataSetId nonce so the idempotency key
+   * (service, sha256(extraData), dataSetId, recordKeeper) is unique per call.
    */
   async signExtraData(pieces: DerivedPiece[]): Promise<Hex> {
+    if (!this.cfg.payee) throw new Error('payee required (auto-discovery should have set it from PROVIDER_ID)')
     const signablePieces = pieces.map((p) => ({ pieceCid: parsePieceCid(p.pieceCid) }))
-    if (this.cfg.dataSetId === 0n) {
-      if (!this.cfg.payee) throw new Error('payee is required when dataSetId=0')
-      return signCreateDataSetAndAddPieces(this.client as any, {
-        payee: this.cfg.payee,
-        payer: this.account.address,
-        pieces: signablePieces,
-        clientDataSetId: randU256(),
-      })
-    }
-    return signAddPieces(this.client as any, {
-      clientDataSetId: randU256(),
+    return signCreateDataSetAndAddPieces(this.client as any, {
+      payee: this.cfg.payee,
+      payer: this.account.address,
       pieces: signablePieces,
+      clientDataSetId: randU256(),
     })
   }
 
