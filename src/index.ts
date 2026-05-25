@@ -3,6 +3,7 @@
 import 'dotenv/config'
 import { Command } from 'commander'
 import type { Hex, Address } from 'viem'
+import { calibration, mainnet } from '@filoz/synapse-core/chains'
 import { SourceServer } from './source-server.js'
 import { PullLoader, formatStats, summarize, type LoaderConfig, type Network } from './loader.js'
 import { DEFAULT_SIZE_MIX, deriveBatch, parseSalt } from './piece.js'
@@ -374,9 +375,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 function defaultRecordKeeper(): Address {
-  // Mirror loader's default: chain.contracts.fwss.address. We import calibration
-  // here lazily to avoid a top-level dep cycle.
-  const { calibration, mainnet } = require('@filoz/synapse-core/chains') as typeof import('@filoz/synapse-core/chains')
   const net = (process.env.NETWORK ?? 'calibration') as Network
   const chain = net === 'mainnet' ? mainnet : calibration
   return chain.contracts.fwss.address as Address
