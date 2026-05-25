@@ -153,30 +153,18 @@ program.command('multi-url')
     console.log(`deriving ${count} pieces (each will appear 3x with [bad-404, bad-${badStatus}, good] sources)...`)
     const base = await deriveBatch(salt, startIndex, count, [{ size, weight: 1 }])
 
-    // Expand each piece into 3 entries with the same pieceCid + index but
-    // different sourceUrl by tacking ?status=… onto two of the three URLs.
-    // The pull-handler regex matches /piece/{cid}$ on the URL path, query
-    // is preserved and forwarded to the source-server.
-    type Pull = Parameters<typeof loader.submit>[0]
-    const expanded: Pull = []
-    for (const p of base) {
-      const goodUrl = loader.buildSourceUrl(p)
-      const bad404 = goodUrl + '&status=404'
-      const badX = goodUrl + `&status=${badStatus}`
-      // Same pieceCid + raw size, different SourceURL: handler accepts these
-      // as distinct items keyed on (fetch_id, piece_cid, source_url).
-      // We fake DerivedPiece by overriding the URL builder via a synthetic
-      // index field — but loader.buildSourceUrl is what we call. Instead,
-      // pass DerivedPiece copies and override sourceUrl directly below.
-      expanded.push(p, p, p)
-    }
-    // We need three sourceUrls per piece — recompose by hand using submit's
-    // raw-body path. Easier: monkey-extend the submit body. Use signExtraData
-    // + raw fetch.
-    const ed = await loader.signExtraData(base)  // sign covers only distinct pieces
+    // Build 9 pieces (3 unique CIDs × 3 source URLs each). Curio's handler
+    // accepts duplicate pieceCids when sourceUrl differs — (fetch_id,
+    // piece_cid, source_url) is the unique key. But FWSS's eth_call
+    // validation checks pieceMetadata.length == pieces.length (otherwise
+    // MetadataArrayCountMismatch, selector 0x9b7cf882), so the signed
+    // extraData must also encode 9 piece-metadata slots — i.e. sign for the
+    // expanded list, not just the distinct ones.
+    const expandedPieces = base.flatMap((p) => [p, p, p])
+    const ed = await loader.signExtraData(expandedPieces)
     const body: Record<string, unknown> = {
       extraData: ed,
-      recordKeeper: process.env.RECORD_KEEPER || undefined,
+      recordKeeper: (process.env.RECORD_KEEPER || defaultRecordKeeper()) as Address,
       pieces: base.flatMap((p) => {
         const good = loader.buildSourceUrl(p)
         return [
@@ -186,10 +174,6 @@ program.command('multi-url')
         ]
       }),
     }
-    if (!body.recordKeeper) {
-      // Let loader fill it via chain default — but we built body ourselves; mirror logic
-      delete body.recordKeeper
-    }
     const dataSetId = BigInt(process.env.DATA_SET_ID ?? '0')
     if (dataSetId > 0n) body.dataSetId = Number(dataSetId)
 
@@ -198,7 +182,7 @@ program.command('multi-url')
     const res = await fetch(`${loader.effectiveCurioUrl}/pdp/piece/pull`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, recordKeeper: body.recordKeeper ?? defaultRecordKeeper() }),
+      body: JSON.stringify(body),
     })
     console.log(`initial POST: http=${res.status} elapsed=${Date.now() - startedAt}ms`)
     const text = await res.text()
@@ -214,7 +198,7 @@ program.command('multi-url')
       const r = await fetch(`${loader.effectiveCurioUrl}/pdp/piece/pull`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...body, recordKeeper: body.recordKeeper ?? defaultRecordKeeper() }),
+        body: JSON.stringify(body),
       })
       const j = (await r.json()) as { status: string; pieces: Array<{ pieceCid: string; status: string }> }
       console.log(`poll: overall=${j.status} ${j.pieces.map((p) => p.status).join(',')}`)
