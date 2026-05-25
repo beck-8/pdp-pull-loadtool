@@ -18,7 +18,7 @@ import { calibration, mainnet, type Chain as FocChain } from '@filoz/synapse-cor
 import { parse as parsePieceCid } from '@filoz/synapse-core/piece'
 import { signCreateDataSetAndAddPieces } from '@filoz/synapse-core/typed-data'
 import { randU256 } from '@filoz/synapse-core/utils'
-import { getClientDataSets } from '@filoz/synapse-core/warm-storage'
+import { getPdpDataSets } from '@filoz/synapse-core/warm-storage'
 import { getPDPProvider, getPDPProviders } from '@filoz/synapse-core/sp-registry'
 import type { DerivedPiece } from './piece.js'
 
@@ -117,23 +117,29 @@ export class PullLoader {
       }
     }
 
-    // Step 2: existing dataset for this signer
+    // Step 2: existing dataset for this signer.
+    // Use getPdpDataSets so we get `live` — getClientDataSets returns rows that
+    // are still indexed even after DataSetPaymentAlreadyTerminated (selector
+    // 0x211a40c0), and picking such a row makes eth_call validation revert.
     if (this.cfg.dataSetId === 0n) {
       try {
-        const sets = await getClientDataSets(this.publicClient as any, { address: this.account.address })
-        const usable = sets.filter((s) => s.dataSetId > 0n)
-        if (usable.length > 0) {
-          // Prefer one matching providerId if we have it; else first.
+        const sets = await getPdpDataSets(this.publicClient as any, { address: this.account.address })
+        const live = sets.filter((s) => s.live && s.dataSetId > 0n)
+        const dead = sets.length - live.length
+        if (live.length > 0) {
           const pick = (this.cfg.providerId != null
-            ? usable.find((s) => s.providerId === this.cfg.providerId)
-            : undefined) ?? usable[0]
+            ? live.find((s) => s.providerId === this.cfg.providerId)
+            : undefined) ?? live[0]
           this.cfg.dataSetId = pick.dataSetId
           if (!this.cfg.payee) this.cfg.payee = pick.payee
-          console.log(`[discover] dataSetId=${pick.dataSetId} (existing, payee=${pick.payee} providerId=${pick.providerId})`)
-          return  // dataset found → addPieces path, payee no longer required
+          console.log(`[discover] dataSetId=${pick.dataSetId} (live; ${dead} terminated rows ignored; payee=${pick.payee} providerId=${pick.providerId})`)
+        } else if (dead > 0) {
+          console.log(`[discover] no live dataset (found ${dead} terminated) — pull will go through the create-new eth_call path; no on-chain dataset is actually created`)
+        } else {
+          console.log(`[discover] no existing dataset for ${this.account.address} — pull will go through the create-new eth_call path`)
         }
       } catch (e) {
-        console.warn(`[discover] getClientDataSets failed: ${(e as Error).message}`)
+        console.warn(`[discover] getPdpDataSets failed: ${(e as Error).message}`)
       }
     } else {
       console.log(`[discover] dataSetId=${this.cfg.dataSetId} (from config)`)
