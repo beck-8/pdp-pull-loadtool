@@ -45,7 +45,7 @@ program.command('smoke')
   .option('--poll-interval <ms>', 'poll interval', '4000')
   .option('--timeout <ms>', 'overall poll timeout', String(10 * 60_000))
   .action(async (opts) => {
-    const loader = buildLoader()
+    const loader = await buildLoader()
     const count = Number(opts.count)
     const startIndex = Number(opts.startIndex)
 
@@ -91,7 +91,7 @@ program.command('backpressure')
   .option('--pieces-per-pull <n>', 'pieces in each pull request', '1')
   .option('-s, --size <bytes>', 'fixed piece size (default: small from mix)', '4096')
   .action(async (opts) => {
-    const loader = buildLoader()
+    const loader = await buildLoader()
     const burst = Number(opts.burst)
     const concurrency = Number(opts.concurrency)
     const piecesPerPull = Number(opts.piecesPerPull)
@@ -141,7 +141,7 @@ program.command('multi-url')
   .option('--bad-status <code>', 'fault to inject on the bad source URLs', '500')
   .option('--timeout <ms>', 'overall poll timeout', String(15 * 60_000))
   .action(async (opts) => {
-    const loader = buildLoader()
+    const loader = await buildLoader()
     const salt = parseSalt(requireEnv('DERIVE_SALT'))
     const count = Number(opts.count)
     const size = Number(opts.size)
@@ -194,7 +194,7 @@ program.command('multi-url')
 
     console.log(`submitting pull with ${(body.pieces as any[]).length} items (${count} unique pieceCids × 3 URLs)...`)
     const startedAt = Date.now()
-    const res = await fetch(`${process.env.CURIO_URL!.replace(/\/+$/, '')}/pdp/piece/pull`, {
+    const res = await fetch(`${loader.effectiveCurioUrl}/pdp/piece/pull`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, recordKeeper: body.recordKeeper ?? defaultRecordKeeper() }),
@@ -210,7 +210,7 @@ program.command('multi-url')
     const deadline = Date.now() + Number(opts.timeout)
     while (Date.now() < deadline) {
       await sleep(4000)
-      const r = await fetch(`${process.env.CURIO_URL!.replace(/\/+$/, '')}/pdp/piece/pull`, {
+      const r = await fetch(`${loader.effectiveCurioUrl}/pdp/piece/pull`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...body, recordKeeper: body.recordKeeper ?? defaultRecordKeeper() }),
@@ -236,7 +236,7 @@ program.command('stale')
   .option('--bytes-per-sec <n>', 'source throttle (default 1B/s → guarantees attempt timeout)', '1')
   .option('--timeout <ms>', 'overall poll timeout (should exceed 30min budget)', String(35 * 60_000))
   .action(async (opts) => {
-    const loader = buildLoader()
+    const loader = await buildLoader()
     const salt = parseSalt(requireEnv('DERIVE_SALT'))
     const startIndex = Date.now() & 0xffffffff
     const pieces = await deriveBatch(salt, startIndex, Number(opts.count), [{ size: Number(opts.size), weight: 1 }])
@@ -270,7 +270,7 @@ program.command('soak')
   .option('--pieces-per-pull <n>', 'pieces per pull request', '1')
   .option('--concurrency <n>', 'max in-flight submits', '20')
   .action(async (opts) => {
-    const loader = buildLoader()
+    const loader = await buildLoader()
     const salt = parseSalt(requireEnv('DERIVE_SALT'))
     const ratePerMin = Number(opts.rate)
     const intervalMs = 60_000 / ratePerMin
@@ -345,25 +345,28 @@ function requireEnv(name: string): string {
   return v
 }
 
-function buildLoader(): PullLoader {
+async function buildLoader(): Promise<PullLoader> {
   const network = (process.env.NETWORK ?? 'calibration') as Network
   if (network !== 'calibration' && network !== 'mainnet') {
     throw new Error('NETWORK must be calibration or mainnet')
   }
   const pk = requireEnv('PRIVATE_KEY')
+  const providerIdStr = process.env.PROVIDER_ID
+  const curioUrlEnv = process.env.CURIO_URL?.replace(/\/+$/, '')
+  if (!providerIdStr && !curioUrlEnv) {
+    throw new Error('Set PROVIDER_ID (recommended — auto-discovers everything) or CURIO_URL in .env')
+  }
   const cfg: LoaderConfig = {
     network,
     privateKey: (pk.startsWith('0x') ? pk : `0x${pk}`) as Hex,
-    curioUrl: requireEnv('CURIO_URL').replace(/\/+$/, ''),
+    providerId: providerIdStr ? BigInt(providerIdStr) : undefined,
+    curioUrl: curioUrlEnv,
     sourcePublicUrl: requireEnv('SOURCE_PUBLIC_URL').replace(/\/+$/, ''),
     dataSetId: BigInt(process.env.DATA_SET_ID ?? '0'),
     payee: (process.env.PAYEE_ADDRESS || undefined) as Address | undefined,
     recordKeeper: (process.env.RECORD_KEEPER || undefined) as Address | undefined,
   }
-  if (cfg.dataSetId === 0n && !cfg.payee) {
-    throw new Error('PAYEE_ADDRESS required when DATA_SET_ID is 0')
-  }
-  return new PullLoader(cfg)
+  return PullLoader.create(cfg)
 }
 
 function sleep(ms: number): Promise<void> {

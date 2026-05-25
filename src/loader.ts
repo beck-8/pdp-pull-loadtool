@@ -12,12 +12,14 @@
  * request until terminal.
  */
 
-import { createWalletClient, http, type Address, type Hex, type WalletClient } from 'viem'
+import { createPublicClient, createWalletClient, http, type Address, type Hex, type PublicClient, type WalletClient } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { calibration, mainnet, type Chain as FocChain } from '@filoz/synapse-core/chains'
 import { parse as parsePieceCid } from '@filoz/synapse-core/piece'
 import { signAddPieces, signCreateDataSetAndAddPieces } from '@filoz/synapse-core/typed-data'
 import { randU256 } from '@filoz/synapse-core/utils'
+import { getClientDataSets } from '@filoz/synapse-core/warm-storage'
+import { getPDPProvider, getPDPProviders } from '@filoz/synapse-core/sp-registry'
 import type { DerivedPiece } from './piece.js'
 
 export type Network = 'calibration' | 'mainnet'
@@ -25,11 +27,18 @@ export type Network = 'calibration' | 'mainnet'
 export interface LoaderConfig {
   network: Network
   privateKey: Hex
-  curioUrl: string         // e.g. https://your-curio.example.com (no trailing slash)
-  sourcePublicUrl: string  // e.g. https://source.example.com (no trailing slash)
-  dataSetId: bigint        // 0n = create new
-  payee?: Address          // required when dataSetId === 0n
-  recordKeeper?: Address   // defaults to chain.contracts.fwss.address
+  /** Source server's public URL — Curio dials this. */
+  sourcePublicUrl: string
+  /** Provider ID in the on-chain SP registry. Resolves curioUrl + payee. */
+  providerId?: bigint
+  /** Explicit Curio URL override. If unset, discovered from providerId. */
+  curioUrl?: string
+  /** 0n = pick an existing dataset for this signer (auto), or create new. */
+  dataSetId: bigint
+  /** Required only when no existing dataset and providerId can't resolve it. */
+  payee?: Address
+  /** Defaults to chain.contracts.fwss.address. */
+  recordKeeper?: Address
 }
 
 export type PullPieceInput = {
@@ -59,21 +68,118 @@ export class PullLoader {
   private readonly cfg: LoaderConfig
   private readonly chain: FocChain
   private readonly client: WalletClient
+  private readonly publicClient: PublicClient
   private readonly account: ReturnType<typeof privateKeyToAccount>
 
-  constructor(cfg: LoaderConfig) {
+  private constructor(cfg: LoaderConfig) {
     this.cfg = cfg
     this.chain = cfg.network === 'calibration' ? calibration : mainnet
     this.account = privateKeyToAccount(cfg.privateKey)
-    this.client = createWalletClient({
-      account: this.account,
-      chain: this.chain,
-      transport: http(),
-    })
+    const transport = http()
+    this.client = createWalletClient({ account: this.account, chain: this.chain, transport })
+    this.publicClient = createPublicClient({ chain: this.chain, transport })
+  }
+
+  /**
+   * Factory: builds a loader and runs auto-discovery for any unset fields
+   * (dataSetId, payee). Prints what it found so the user can lock the values
+   * into .env if they want stability across runs.
+   */
+  static async create(cfg: LoaderConfig): Promise<PullLoader> {
+    const l = new PullLoader(cfg)
+    await l.discover()
+    return l
+  }
+
+  /**
+   * Fill in curioUrl, payee, dataSetId from PROVIDER_ID + on-chain lookups
+   * if any are missing.
+   *
+   * Priority:
+   *   1. providerId → SP registry → curioUrl (= pdp.serviceURL) + payee
+   *   2. Existing dataset for this signer → dataSetId (lets us use addPieces
+   *      signing path; payee from dataset is also recorded for visibility)
+   *   3. If we still need payee but have neither provider nor dataset → enumerate
+   *      active PDP providers and try to host-match curioUrl.
+   */
+  private async discover(): Promise<void> {
+    // Step 1: PROVIDER_ID → curioUrl + payee
+    if (this.cfg.providerId != null) {
+      const p = await getPDPProvider(this.publicClient as any, { providerId: this.cfg.providerId })
+      if (!p) throw new Error(`provider id ${this.cfg.providerId} not found in SP registry`)
+      if (!this.cfg.curioUrl) {
+        this.cfg.curioUrl = p.pdp.serviceURL.replace(/\/+$/, '')
+        console.log(`[discover] curioUrl=${this.cfg.curioUrl} (from providerId=${this.cfg.providerId})`)
+      }
+      if (!this.cfg.payee) {
+        this.cfg.payee = (p as any).payee as Address
+        console.log(`[discover] payee=${this.cfg.payee} (from providerId=${this.cfg.providerId})`)
+      }
+    }
+
+    // Step 2: existing dataset for this signer
+    if (this.cfg.dataSetId === 0n) {
+      try {
+        const sets = await getClientDataSets(this.publicClient as any, { address: this.account.address })
+        const usable = sets.filter((s) => s.dataSetId > 0n)
+        if (usable.length > 0) {
+          // Prefer one matching providerId if we have it; else first.
+          const pick = (this.cfg.providerId != null
+            ? usable.find((s) => s.providerId === this.cfg.providerId)
+            : undefined) ?? usable[0]
+          this.cfg.dataSetId = pick.dataSetId
+          if (!this.cfg.payee) this.cfg.payee = pick.payee
+          console.log(`[discover] dataSetId=${pick.dataSetId} (existing, payee=${pick.payee} providerId=${pick.providerId})`)
+          return  // dataset found → addPieces path, payee no longer required
+        }
+      } catch (e) {
+        console.warn(`[discover] getClientDataSets failed: ${(e as Error).message}`)
+      }
+    } else {
+      console.log(`[discover] dataSetId=${this.cfg.dataSetId} (from config)`)
+    }
+
+    // Step 3: still no curioUrl? Can't proceed.
+    if (!this.cfg.curioUrl) {
+      throw new Error('curioUrl unresolved — set PROVIDER_ID (recommended) or CURIO_URL in .env')
+    }
+
+    // Step 4: still no payee? Last-resort host match against the SP registry.
+    if (!this.cfg.payee) {
+      const curioHost = new URL(this.cfg.curioUrl).host.toLowerCase()
+      const { providers } = await getPDPProviders(this.publicClient as any)
+      const active = providers.filter((p: any) => p.isActive)
+      const match = active.find((p: any) => {
+        try { return new URL(p.pdp.serviceURL).host.toLowerCase() === curioHost }
+        catch { return false }
+      })
+      if (match) {
+        this.cfg.payee = match.payee as Address
+        console.log(`[discover] payee=${match.payee} (host-matched providerId=${match.id} serviceURL=${match.pdp.serviceURL})`)
+      } else {
+        const list = active.map((p: any) => `  PROVIDER_ID=${p.id}  # ${p.pdp.serviceURL}`).join('\n')
+        throw new Error(
+          `Could not auto-discover payee for ${curioHost}.\n` +
+          `Pick one of these and add to .env:\n${list || '  (no active providers on registry)'}`)
+      }
+    }
   }
 
   get signerAddress(): Address {
     return this.account.address
+  }
+
+  get effectiveDataSetId(): bigint {
+    return this.cfg.dataSetId
+  }
+
+  get effectivePayee(): Address | undefined {
+    return this.cfg.payee
+  }
+
+  get effectiveCurioUrl(): string {
+    if (!this.cfg.curioUrl) throw new Error('curioUrl unresolved')
+    return this.cfg.curioUrl
   }
 
   /**
@@ -124,6 +230,7 @@ export class PullLoader {
     }
     if (this.cfg.dataSetId > 0n) body.dataSetId = Number(this.cfg.dataSetId)
 
+    if (!this.cfg.curioUrl) throw new Error('curioUrl not set — call PullLoader.create() (which runs discover) instead of new PullLoader()')
     const url = `${this.cfg.curioUrl}/pdp/piece/pull`
     const startedAt = Date.now()
     const res = await fetch(url, {
