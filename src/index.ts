@@ -165,12 +165,16 @@ program.command('multi-url')
     const body: Record<string, unknown> = {
       extraData: ed,
       recordKeeper: (process.env.RECORD_KEEPER || defaultRecordKeeper()) as Address,
+      // Curio iterates sources via index scan on PK (fetch_id, piece_cid,
+      // source_url) — i.e. ASCII order of source_url, NOT body order. Prefix
+      // an &attempt= tag so bad URLs lex-sort BEFORE the good one, otherwise
+      // good gets picked first and fallback is never exercised.
       pieces: base.flatMap((p) => {
         const good = loader.buildSourceUrl(p)
         return [
-          { pieceCid: p.pieceCid, sourceUrl: good + '&status=404' },
-          { pieceCid: p.pieceCid, sourceUrl: good + `&status=${badStatus}` },
-          { pieceCid: p.pieceCid, sourceUrl: good },
+          { pieceCid: p.pieceCid, sourceUrl: good + '&attempt=a-bad404&status=404' },
+          { pieceCid: p.pieceCid, sourceUrl: good + `&attempt=b-bad${badStatus}&status=${badStatus}` },
+          { pieceCid: p.pieceCid, sourceUrl: good + '&attempt=c-good' },
         ]
       }),
     }
@@ -205,7 +209,10 @@ program.command('multi-url')
       if (j.status === 'complete' || j.status === 'failed') {
         console.log('\nfinal:')
         console.log(JSON.stringify(j, null, 2))
-        console.log('\nCheck source-server /admin/stats — every good URL should have ok>=1, bad URLs should have fail>=1.')
+        console.log('\nCheck source-server /admin/stats:')
+        console.log('  - Each of the 3 pieces should show ok=1 (good URL succeeded).')
+        console.log('  - fail should be ~2 per piece (the two bad URLs were tried and rejected first).')
+        console.log('  - If fail=0, multi-URL fallback did NOT happen — investigate Curio source ordering.')
         process.exit(j.status === 'complete' ? 0 : 1)
       }
     }
